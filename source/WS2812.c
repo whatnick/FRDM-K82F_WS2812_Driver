@@ -1,8 +1,15 @@
 #include <stdint.h>
 #include "WS2812.h"
 #include "MK82F25615.h"
+#include "fsl_edma.h"
+#include "fsl_dmamux.h"
 
-static uint32_t *isr_p32_strip_data, isr_data_cnt, isr_data_index, isr_cnt, isr_transfer_done;
+#include "fsl_debug_console.h"
+#include "pin_mux.h"
+#include "clock_config.h"
+
+static uint32_t *isr_p32_strip_data, isr_data_cnt, isr_data_index, isr_cnt,
+		isr_transfer_done;
 
 // FLEXIO0 isr indicator: high when the FLEXIO0 isr is running
 #define	FLEXIO_ISR_PORT			PORTE
@@ -36,33 +43,39 @@ static uint32_t *isr_p32_strip_data, isr_data_cnt, isr_data_index, isr_cnt, isr_
 static uint32_t ws2812_generator_shifter;
 static uint32_t ws2812_ret_timer;
 
+//EDMA Handle
+edma_handle_t g_EDMA_Handle;
+#define BUFF_LENGTH 4
+
 void WS2812_Init(void) {
-  uint32_t ws2812_generator_timer;
-  uint32_t ws2812_generator_clk_fxio_pin, ws2812_generator_data_fxio_pin;
-  uint32_t ws2812_l0_timer, ws2812_l0_timer_fxio_pin;
-  uint32_t ws2812_l1_timer, ws2812_l1_timer_fxio_pin;
-  uint32_t ws2812_ret_fxio_pin;
-  uint32_t ws2812_strip0_fxio_pin; /* pin number to be used for LED strip output, on PORT D */
+	uint32_t ws2812_generator_timer;
+	uint32_t ws2812_generator_clk_fxio_pin, ws2812_generator_data_fxio_pin;
+	uint32_t ws2812_l0_timer, ws2812_l0_timer_fxio_pin;
+	uint32_t ws2812_l1_timer, ws2812_l1_timer_fxio_pin;
+	uint32_t ws2812_ret_fxio_pin;
+	uint32_t ws2812_strip0_fxio_pin; /* pin number to be used for LED strip output, on PORT D */
 
-  // enable access to all port registers
-	SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTB_MASK |\
-								SIM_SCGC5_PORTC_MASK | SIM_SCGC5_PORTD_MASK |\
-								SIM_SCGC5_PORTE_MASK;
-	
-  // FLEXIO0 isr: output, low, GPIO
-  FLEXIO_ISR_IOPORT->PDDR |= 1UL<<FLEXIO_ISR_PIN;
-  FLEXIO_ISR_IOPORT->PCOR = 1UL<<FLEXIO_ISR_PIN;
-  FLEXIO_ISR_PORT->PCR[FLEXIO_ISR_PIN] = PORT_PCR_MUX(1);
+	// enable access to all port registers
+	SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTB_MASK
+			|\
+ SIM_SCGC5_PORTC_MASK | SIM_SCGC5_PORTD_MASK
+			|\
+ SIM_SCGC5_PORTE_MASK;
 
-  // waiting loop: output, low, GPIO
-  WAITING_LOOP_IOPORT->PDDR |= 1UL<<WAITING_LOOP_PIN;
-  WAITING_LOOP_IOPORT->PCOR = 1UL<<WAITING_LOOP_PIN;
-  WAITING_LOOP_PORT->PCR[WAITING_LOOP_PIN] = PORT_PCR_MUX(1);
-	
+	// FLEXIO0 isr: output, low, GPIO
+	FLEXIO_ISR_IOPORT->PDDR |= 1UL << FLEXIO_ISR_PIN;
+	FLEXIO_ISR_IOPORT->PCOR = 1UL << FLEXIO_ISR_PIN;
+	FLEXIO_ISR_PORT->PCR[FLEXIO_ISR_PIN] = PORT_PCR_MUX(1);
+
+	// waiting loop: output, low, GPIO
+	WAITING_LOOP_IOPORT->PDDR |= 1UL << WAITING_LOOP_PIN;
+	WAITING_LOOP_IOPORT->PCOR = 1UL << WAITING_LOOP_PIN;
+	WAITING_LOOP_PORT->PCR[WAITING_LOOP_PIN] = PORT_PCR_MUX(1);
+
 	// resource allocation
 	ws2812_generator_timer = 0;
 	ws2812_generator_shifter = 0;
-	
+
 	// FLEXIO0 will use the 8 MHz IRC so make sure it is on
 	// and select it as the FLEXIO0 clock source
 	MCG->C1 |= MCG_C1_IRCLKEN_MASK;
@@ -70,29 +83,30 @@ void WS2812_Init(void) {
 	//TODO: Fix ME no MC on K82F
 	//MCG->MC = MCG_MC_LIRC_DIV2(0);
 	MCG->SC = MCG_SC_FCRDIV(0);
-	SIM->SOPT2 = (SIM->SOPT2 & SIM_SOPT2_FLEXIOSRC_MASK) | SIM_SOPT2_FLEXIOSRC(3);
-	
-	//FLEXIO0 timer allocation
-	ws2812_generator_timer 	= 0;
-	ws2812_l0_timer					= 1;
-	ws2812_l1_timer					= 2;
-	ws2812_ret_timer				= 3;
-	
-	//FLEXIO0 shifter allocation
-	ws2812_generator_shifter= 0;
+	SIM->SOPT2 = (SIM->SOPT2 & SIM_SOPT2_FLEXIOSRC_MASK)
+			| SIM_SOPT2_FLEXIOSRC(3);
 
-	// KL43Z pin selection (in the application) begin
-	ws2812_strip0_fxio_pin					= 6; /* strip data on PTD6 */
-	ws2812_generator_clk_fxio_pin		= 2; /* generator clock on PTD2 */
-	ws2812_generator_data_fxio_pin	= 3; /* data 1 on PTD3 */
-	ws2812_l0_timer_fxio_pin				= ws2812_strip0_fxio_pin; /* timer 0 output on strip data pin */
-	ws2812_l1_timer_fxio_pin				= ws2812_strip0_fxio_pin; /* timer 1 output on strip data pin */
-	ws2812_ret_fxio_pin							= 4; /* RET (end of pixel data) on PTD4 */
-	
-	PORTD->PCR[ 2] = PORT_PCR_MUX(6);	//PTD02 - FXIO_D2
-	PORTD->PCR[ 3] = PORT_PCR_MUX(6);	//PTD03 - FXIO_D3
-	PORTD->PCR[ 4] = PORT_PCR_MUX(6);	//PTD04 - FXIO_D4
-	PORTD->PCR[ 6] = PORT_PCR_MUX(6);	//PTD06 - FXIO_D6
+	//FLEXIO0 timer allocation
+	ws2812_generator_timer = 0;
+	ws2812_l0_timer = 1;
+	ws2812_l1_timer = 2;
+	ws2812_ret_timer = 3;
+
+	//FLEXIO0 shifter allocation
+	ws2812_generator_shifter = 0;
+
+	// TODO: MK82F pin selection pin selection (in the application) begin
+	ws2812_strip0_fxio_pin = 6; /* strip data on PTD6 */
+	ws2812_generator_clk_fxio_pin = 2; /* generator clock on PTD2 */
+	ws2812_generator_data_fxio_pin = 3; /* data 1 on PTD3 */
+	ws2812_l0_timer_fxio_pin = ws2812_strip0_fxio_pin; /* timer 0 output on strip data pin */
+	ws2812_l1_timer_fxio_pin = ws2812_strip0_fxio_pin; /* timer 1 output on strip data pin */
+	ws2812_ret_fxio_pin = 4; /* RET (end of pixel data) on PTD4 */
+
+	PORTD->PCR[2] = PORT_PCR_MUX(6);	//PTD02 - FXIO_D2
+	PORTD->PCR[3] = PORT_PCR_MUX(6);	//PTD03 - FXIO_D3
+	PORTD->PCR[4] = PORT_PCR_MUX(6);	//PTD04 - FXIO_D4
+	PORTD->PCR[6] = PORT_PCR_MUX(6);	//PTD06 - FXIO_D6
 	//TODO: MK82F pin selection (in the application) end
 
 	// disable FLEXIO0 IRQ
@@ -100,13 +114,13 @@ void WS2812_Init(void) {
 
 	//TODO: enable access to FLEXIO0 registers
 	SIM->SCGC2 |= SIM_SCGC2_FLEXIO_MASK;
-	
+
 	// disable FLEXIO0 module
 	FLEXIO0->CTRL = 0;
 
 	// disable shifter status & timer interrupt
 	FLEXIO0->SHIFTSIEN = 0;
-	FLEXIO0->TIMIEN		= 0;
+	FLEXIO0->TIMIEN = 0;
 
 	// ws2812_generator_shifter setup begin
 	// SPI (CPHA=1) master driven by ws2812_generator_timer
@@ -114,19 +128,19 @@ void WS2812_Init(void) {
 	// this setup is based on the FLEXIO0 SPI master example from the RM
 	//==================================================================
 	FLEXIO0->SHIFTCTL[ws2812_generator_shifter] = 0;	//disable shifter
-	
-	FLEXIO0->SHIFTCFG[ws2812_generator_shifter] =
-									0<<FLEXIO_SHIFTCFG_INSRC_SHIFT	|	//NA
-									FLEXIO_SHIFTCFG_SSTOP(0)				|	//STOP bit disabled
-									FLEXIO_SHIFTCFG_SSTART(1);				//START bit disabled; load data on first shift
-									
+
+	FLEXIO0->SHIFTCFG[ws2812_generator_shifter] = 0
+			<< FLEXIO_SHIFTCFG_INSRC_SHIFT |	//NA
+			FLEXIO_SHIFTCFG_SSTOP(0) |	//STOP bit disabled
+			FLEXIO_SHIFTCFG_SSTART(1);//START bit disabled; load data on first shift
+
 	FLEXIO0->SHIFTCTL[ws2812_generator_shifter] =
-									FLEXIO_SHIFTCTL_TIMSEL(ws2812_generator_timer)	|	//ws2812_generator_timer controls shifter
-									0<<FLEXIO_SHIFTCTL_TIMPOL_SHIFT									|	//shift on posedge of shift clock
-									FLEXIO_SHIFTCTL_PINCFG(3)												|	//shifter pin output
-									FLEXIO_SHIFTCTL_PINSEL(ws2812_generator_data_fxio_pin)		|	//output: ws2812_generator_data_fxio_pin
-									0<<FLEXIO_SHIFTCTL_PINPOL_SHIFT									|	//pin is active high
-									FLEXIO_SHIFTCTL_SMOD(2);													//shifter mode: transmitter
+	FLEXIO_SHIFTCTL_TIMSEL(ws2812_generator_timer) |//ws2812_generator_timer controls shifter
+			0 << FLEXIO_SHIFTCTL_TIMPOL_SHIFT |//shift on posedge of shift clock
+			FLEXIO_SHIFTCTL_PINCFG(3) |	//shifter pin output
+			FLEXIO_SHIFTCTL_PINSEL(ws2812_generator_data_fxio_pin) |//output: ws2812_generator_data_fxio_pin
+			0 << FLEXIO_SHIFTCTL_PINPOL_SHIFT |	//pin is active high
+			FLEXIO_SHIFTCTL_SMOD(2);				//shifter mode: transmitter
 	// ws2812_generator_shifter setup end
 	//------------------------------------
 
@@ -136,31 +150,30 @@ void WS2812_Init(void) {
 	// this setup is based on the FLEXIO0 SPI master example from the RM
 	//==================================================================
 	FLEXIO0->TIMCTL[ws2812_generator_timer] = 0;		//disable timer
-	
-	FLEXIO0->TIMCMP[ws2812_generator_timer] =
-								((32*2)-1)<<8 |									//32 bits
-								((WS2812_CLK_DIVIDER/2)-1);			//FLEXIO0 clock divider set to match the WS2812 timing
-								
+
+	FLEXIO0->TIMCMP[ws2812_generator_timer] = ((32 * 2) - 1) << 8 |//32 bits
+			((WS2812_CLK_DIVIDER / 2) - 1);	//FLEXIO0 clock divider set to match the WS2812 timing
+
 	FLEXIO0->TIMCFG[ws2812_generator_timer] =
-								FLEXIO_TIMCFG_TIMOUT(1)				|	//output is logic zero when enabled not affected by reset
-								FLEXIO_TIMCFG_TIMDEC(0)				|	//decrement on FLEXIO0 clock, shift clock equals timer output
-								FLEXIO_TIMCFG_TIMRST(0)				|	//never reset
-								FLEXIO_TIMCFG_TIMDIS(2)				|	//disable on timer compare
-								FLEXIO_TIMCFG_TIMENA(2)				|	//enabled on trigger high
-								FLEXIO_TIMCFG_TSTOP(0)				|	//STOP bit disabled
-								0<<FLEXIO_TIMCFG_TSTART_SHIFT;	//START bit disabled
-								
+	FLEXIO_TIMCFG_TIMOUT(1) |//output is logic zero when enabled not affected by reset
+			FLEXIO_TIMCFG_TIMDEC(0) |//decrement on FLEXIO0 clock, shift clock equals timer output
+			FLEXIO_TIMCFG_TIMRST(0) |	//never reset
+			FLEXIO_TIMCFG_TIMDIS(2) |	//disable on timer compare
+			FLEXIO_TIMCFG_TIMENA(2) |	//enabled on trigger high
+			FLEXIO_TIMCFG_TSTOP(0) |	//STOP bit disabled
+			0 << FLEXIO_TIMCFG_TSTART_SHIFT;	//START bit disabled
+
 	FLEXIO0->TIMCTL[ws2812_generator_timer] =
-								FLEXIO_TIMCTL_TRGSEL(ws2812_generator_shifter<<2 | 1)	|	//trigger: ws2812_generator_shifter status flag
-								1<<FLEXIO_TIMCTL_TRGPOL_SHIFT	|	//trigger active low
-								1<<FLEXIO_TIMCTL_TRGSRC_SHIFT	|	//internal trigger
-								FLEXIO_TIMCTL_PINCFG(3)				|	//timer pin output
-								FLEXIO_TIMCTL_PINSEL(ws2812_generator_clk_fxio_pin)		|	//output: ws2812_generator_clk_fxio_pin
-								0<<FLEXIO_TIMCTL_PINPOL_SHIFT	|	//output active high
-								FLEXIO_TIMCTL_TIMOD(1);					//dual 8-bit counter baud/bit mode
+	FLEXIO_TIMCTL_TRGSEL(ws2812_generator_shifter<<2 | 1) |//trigger: ws2812_generator_shifter status flag
+			1 << FLEXIO_TIMCTL_TRGPOL_SHIFT |	//trigger active low
+			1 << FLEXIO_TIMCTL_TRGSRC_SHIFT |	//internal trigger
+			FLEXIO_TIMCTL_PINCFG(3) |	//timer pin output
+			FLEXIO_TIMCTL_PINSEL(ws2812_generator_clk_fxio_pin) |//output: ws2812_generator_clk_fxio_pin
+			0 << FLEXIO_TIMCTL_PINPOL_SHIFT |	//output active high
+			FLEXIO_TIMCTL_TIMOD(1);			//dual 8-bit counter baud/bit mode
 	// ws2812_generator_timer setup end
 	//----------------------------------
-	
+
 	// ws2812_l0_timer setup begin (dual 8-bit counters PWM mode)
 	//
 	// a rising edge on ws2812_generator_clk enables this timer; 
@@ -168,32 +181,31 @@ void WS2812_Init(void) {
 	// generating the WS2812 "0 code" waveform and then it stops;
 	// ws2812_generator_clk is the trigger
 	//=========================================================
-	FLEXIO0->TIMCTL[ws2812_l0_timer]	= 0;					//disable timer
-	
-	FLEXIO0->TIMCMP[ws2812_l0_timer]	=
-								(WS2812_T0L_CLKS-1)<< 8	|				//set PWM low period
-								(WS2812_T0H_CLKS-1)<< 0;				//set PWM high period
-	
-	FLEXIO0->TIMCFG[ws2812_l0_timer]	=
-								FLEXIO_TIMCFG_TIMOUT(0) 			|	//timer outputs 1 when enabled and not affected by timer reset
-								FLEXIO_TIMCFG_TIMDEC(0) 			|	//decrement on FLEXIO0 clock
-								FLEXIO_TIMCFG_TIMRST(0) 			|	//never reset
-								FLEXIO_TIMCFG_TIMDIS(2)				|	//disable on compare
-								FLEXIO_TIMCFG_TIMENA(6)				|	//enable on trigger rising edge
-								FLEXIO_TIMCFG_TSTOP(0)				|	//stop bit disabled
-								0<<FLEXIO_TIMCFG_TSTART_SHIFT;	//start bit disabled
-																		
-	FLEXIO0->TIMCTL[ws2812_l0_timer]	=
-								FLEXIO_TIMCTL_TRGSEL(ws2812_generator_clk_fxio_pin<<1 | 0)	|	//trigger select: ws2812_generator_clk_fxio_pin
-								0<<FLEXIO_TIMCTL_TRGPOL_SHIFT	|	//trigger polarity: active high
-								1<<FLEXIO_TIMCTL_TRGSRC_SHIFT	|	//trigger source: internal
-								FLEXIO_TIMCTL_PINCFG(3)				|	//timer pin output
-								FLEXIO_TIMCTL_PINSEL(ws2812_l0_timer_fxio_pin)		|	//pin: ws2812_l0_timer_fxio_pin
-								0<<FLEXIO_TIMCTL_PINPOL_SHIFT	|	//pin is active high
-								FLEXIO_TIMCTL_TIMOD(2);					//dual 8-bit counters PWM mode
+	FLEXIO0->TIMCTL[ws2812_l0_timer] = 0;					//disable timer
+
+	FLEXIO0->TIMCMP[ws2812_l0_timer] = (WS2812_T0L_CLKS - 1) << 8 |//set PWM low period
+			(WS2812_T0H_CLKS - 1) << 0;				//set PWM high period
+
+	FLEXIO0->TIMCFG[ws2812_l0_timer] =
+	FLEXIO_TIMCFG_TIMOUT(0) |//timer outputs 1 when enabled and not affected by timer reset
+			FLEXIO_TIMCFG_TIMDEC(0) |	//decrement on FLEXIO0 clock
+			FLEXIO_TIMCFG_TIMRST(0) |	//never reset
+			FLEXIO_TIMCFG_TIMDIS(2) |	//disable on compare
+			FLEXIO_TIMCFG_TIMENA(6) |	//enable on trigger rising edge
+			FLEXIO_TIMCFG_TSTOP(0) |	//stop bit disabled
+			0 << FLEXIO_TIMCFG_TSTART_SHIFT;	//start bit disabled
+
+	FLEXIO0->TIMCTL[ws2812_l0_timer] =
+	FLEXIO_TIMCTL_TRGSEL(ws2812_generator_clk_fxio_pin<<1 | 0) |//trigger select: ws2812_generator_clk_fxio_pin
+			0 << FLEXIO_TIMCTL_TRGPOL_SHIFT |	//trigger polarity: active high
+			1 << FLEXIO_TIMCTL_TRGSRC_SHIFT |	//trigger source: internal
+			FLEXIO_TIMCTL_PINCFG(3) |	//timer pin output
+			FLEXIO_TIMCTL_PINSEL(ws2812_l0_timer_fxio_pin) |//pin: ws2812_l0_timer_fxio_pin
+			0 << FLEXIO_TIMCTL_PINPOL_SHIFT |	//pin is active high
+			FLEXIO_TIMCTL_TIMOD(2);				//dual 8-bit counters PWM mode
 	// ws2812_l0_timer setup end
 	//---------------------------
-	
+
 	// ws2812_l1_timer setup begin (dual 8-bit counters PWM mode)
 	//
 	// a rising edge on ws2812_generator_data enables this timer and 
@@ -202,32 +214,31 @@ void WS2812_Init(void) {
 	// waveform;
 	// ws2812_generator_data is the trigger
 	//=========================================================
-	FLEXIO0->TIMCTL[ws2812_l1_timer]	= 0;					//disable timer
-	
-	FLEXIO0->TIMCMP[ws2812_l1_timer]	=
-								(WS2812_T1L_CLKS-1)<< 8	|				//set PWM low period
-								(WS2812_T1H_CLKS-1)<< 0;				//set PWM high period
-	
-	FLEXIO0->TIMCFG[ws2812_l1_timer]	=
-								FLEXIO_TIMCFG_TIMOUT(0) 			|	//timer outputs 1 when enabled and not affected by timer reset
-								FLEXIO_TIMCFG_TIMDEC(0) 			|	//decrement on FLEXIO0 clock
-								FLEXIO_TIMCFG_TIMRST(0) 			|	//never reset
-								FLEXIO_TIMCFG_TIMDIS(6)				|	//disable on trigger falling edge
-								FLEXIO_TIMCFG_TIMENA(6)				|	//enable on trigger rising edge
-								FLEXIO_TIMCFG_TSTOP(0)				|	//stop bit disabled
-								0<<FLEXIO_TIMCFG_TSTART_SHIFT;	//start bit disabled
-																		
-	FLEXIO0->TIMCTL[ws2812_l1_timer]	=
-								FLEXIO_TIMCTL_TRGSEL(ws2812_generator_data_fxio_pin<<1 | 0)	|	//trigger select: ws2812_generator_data_fxio_pin
-								0<<FLEXIO_TIMCTL_TRGPOL_SHIFT	|	//trigger polarity: active high
-								1<<FLEXIO_TIMCTL_TRGSRC_SHIFT	|	//trigger source: internal
-								FLEXIO_TIMCTL_PINCFG(3)				|	//timer pin output
-								FLEXIO_TIMCTL_PINSEL(ws2812_l1_timer_fxio_pin)		|	//pin: ws2812_l1_timer_fxio_pin
-								0<<FLEXIO_TIMCTL_PINPOL_SHIFT	|	//pin is active high
-								FLEXIO_TIMCTL_TIMOD(2);					//dual 8-bit counters PWM mode
+	FLEXIO0->TIMCTL[ws2812_l1_timer] = 0;					//disable timer
+
+	FLEXIO0->TIMCMP[ws2812_l1_timer] = (WS2812_T1L_CLKS - 1) << 8 |//set PWM low period
+			(WS2812_T1H_CLKS - 1) << 0;				//set PWM high period
+
+	FLEXIO0->TIMCFG[ws2812_l1_timer] =
+	FLEXIO_TIMCFG_TIMOUT(0) |//timer outputs 1 when enabled and not affected by timer reset
+			FLEXIO_TIMCFG_TIMDEC(0) |	//decrement on FLEXIO0 clock
+			FLEXIO_TIMCFG_TIMRST(0) |	//never reset
+			FLEXIO_TIMCFG_TIMDIS(6) |	//disable on trigger falling edge
+			FLEXIO_TIMCFG_TIMENA(6) |	//enable on trigger rising edge
+			FLEXIO_TIMCFG_TSTOP(0) |	//stop bit disabled
+			0 << FLEXIO_TIMCFG_TSTART_SHIFT;	//start bit disabled
+
+	FLEXIO0->TIMCTL[ws2812_l1_timer] =
+	FLEXIO_TIMCTL_TRGSEL(ws2812_generator_data_fxio_pin<<1 | 0) |//trigger select: ws2812_generator_data_fxio_pin
+			0 << FLEXIO_TIMCTL_TRGPOL_SHIFT |	//trigger polarity: active high
+			1 << FLEXIO_TIMCTL_TRGSRC_SHIFT |	//trigger source: internal
+			FLEXIO_TIMCTL_PINCFG(3) |	//timer pin output
+			FLEXIO_TIMCTL_PINSEL(ws2812_l1_timer_fxio_pin) |//pin: ws2812_l1_timer_fxio_pin
+			0 << FLEXIO_TIMCTL_PINPOL_SHIFT |	//pin is active high
+			FLEXIO_TIMCTL_TIMOD(2);				//dual 8-bit counters PWM mode
 	// ws2812_l1_timer setup end
 	//---------------------------
-	
+
 	// ws2812_ret_timer setup begin (dual 8-bit counter baud/bit mode)
 	//
 	// runs for 50+ us; enabled and reset by the ws2812_generator_clk 
@@ -235,65 +246,68 @@ void WS2812_Init(void) {
 	// count and sets the flag after a RET code has been sent to the 
 	// WS2812 strip; ws2812_generator_clk is the trigger
 	//=================================================================
-	FLEXIO0->TIMCTL[ws2812_ret_timer]	= 0;				//disable timer
-	
-	FLEXIO0->TIMCMP[ws2812_ret_timer]	=
-								(((10+1)*2)-1)<<8 |
-								((40/2)-1)<<0;									//50 us + 1 bit (clk leading edge resets the timer) @ 8 MHz (8 ticks per 1 us)
-																								//(10+1) periods of 5 us (8 MHz/40 = 200 kHz <=> 5 us)
-	
-	FLEXIO0->TIMCFG[ws2812_ret_timer]	=
-								FLEXIO_TIMCFG_TIMOUT(0) 			|	//timer outputs logic 1 when enabled and not affected by timer reset
-								FLEXIO_TIMCFG_TIMDEC(0) 			|	//decrement on FLEXIO0 clock
-								FLEXIO_TIMCFG_TIMRST(6) 			|	//reset on trigger rising edge
-								FLEXIO_TIMCFG_TIMDIS(2)				|	//disable on compare
-								FLEXIO_TIMCFG_TIMENA(6)				|	//enable on trigger rising edge
-								FLEXIO_TIMCFG_TSTOP(0)				|	//stop bit disabled
-								0<<FLEXIO_TIMCFG_TSTART_SHIFT;	//start bit disabled
-																		
-	FLEXIO0->TIMCTL[ws2812_ret_timer]	=
-								FLEXIO_TIMCTL_TRGSEL(ws2812_generator_clk_fxio_pin<<1 | 0)	|	//trigger select: ws2812_generator_clk_fxio_pin
-								0<<FLEXIO_TIMCTL_TRGPOL_SHIFT	|	//trigger polarity: active high
-								1<<FLEXIO_TIMCTL_TRGSRC_SHIFT	|	//trigger source: internal
-								FLEXIO_TIMCTL_PINCFG(3)				|	//timer pin output enbled
-								FLEXIO_TIMCTL_PINSEL(ws2812_ret_fxio_pin)		|	//pin: ws2812_ret_fxio_pin
-								0<<FLEXIO_TIMCTL_PINPOL_SHIFT	|	//pin polarity: NA
-								FLEXIO_TIMCTL_TIMOD(1);					//dual 8-bit counter baud/bit mode
+	FLEXIO0->TIMCTL[ws2812_ret_timer] = 0;				//disable timer
+
+	FLEXIO0->TIMCMP[ws2812_ret_timer] = (((10 + 1) * 2) - 1) << 8
+			| ((40 / 2) - 1) << 0;//50 us + 1 bit (clk leading edge resets the timer) @ 8 MHz (8 ticks per 1 us)
+								  //(10+1) periods of 5 us (8 MHz/40 = 200 kHz <=> 5 us)
+
+	FLEXIO0->TIMCFG[ws2812_ret_timer] =
+	FLEXIO_TIMCFG_TIMOUT(0) |//timer outputs logic 1 when enabled and not affected by timer reset
+			FLEXIO_TIMCFG_TIMDEC(0) |	//decrement on FLEXIO0 clock
+			FLEXIO_TIMCFG_TIMRST(6) |	//reset on trigger rising edge
+			FLEXIO_TIMCFG_TIMDIS(2) |	//disable on compare
+			FLEXIO_TIMCFG_TIMENA(6) |	//enable on trigger rising edge
+			FLEXIO_TIMCFG_TSTOP(0) |	//stop bit disabled
+			0 << FLEXIO_TIMCFG_TSTART_SHIFT;	//start bit disabled
+
+	FLEXIO0->TIMCTL[ws2812_ret_timer] =
+	FLEXIO_TIMCTL_TRGSEL(ws2812_generator_clk_fxio_pin<<1 | 0) |//trigger select: ws2812_generator_clk_fxio_pin
+			0 << FLEXIO_TIMCTL_TRGPOL_SHIFT |	//trigger polarity: active high
+			1 << FLEXIO_TIMCTL_TRGSRC_SHIFT |	//trigger source: internal
+			FLEXIO_TIMCTL_PINCFG(3) |	//timer pin output enbled
+			FLEXIO_TIMCTL_PINSEL(ws2812_ret_fxio_pin) |//pin: ws2812_ret_fxio_pin
+			0 << FLEXIO_TIMCTL_PINPOL_SHIFT |	//pin polarity: NA
+			FLEXIO_TIMCTL_TIMOD(1);			//dual 8-bit counter baud/bit mode
 	// ws2812_ret_timer setup end
 	//----------------------------
 
+	// Configure output pin for LED stripe
+	FLEXIO0->TIMCTL[ws2812_l0_timer] = (FLEXIO0->TIMCTL[ws2812_l0_timer]
+			& ~FLEXIO_TIMCTL_PINSEL_MASK)
+			| FLEXIO_TIMCTL_PINSEL(ws2812_strip0_fxio_pin);
 
-  // Configure output pin for LED stripe
-	FLEXIO0->TIMCTL[ws2812_l0_timer] =
-                (FLEXIO0->TIMCTL[ws2812_l0_timer] & ~FLEXIO_TIMCTL_PINSEL_MASK) |
-                FLEXIO_TIMCTL_PINSEL(ws2812_strip0_fxio_pin);
+	FLEXIO0->TIMCTL[ws2812_l1_timer] = (FLEXIO0->TIMCTL[ws2812_l1_timer]
+			& ~FLEXIO_TIMCTL_PINSEL_MASK)
+			| FLEXIO_TIMCTL_PINSEL(ws2812_strip0_fxio_pin);
 
-  FLEXIO0->TIMCTL[ws2812_l1_timer] =
-                (FLEXIO0->TIMCTL[ws2812_l1_timer] & ~FLEXIO_TIMCTL_PINSEL_MASK) |
-                FLEXIO_TIMCTL_PINSEL(ws2812_strip0_fxio_pin);
-	
-
-
-  FLEXIO0->TIMSTAT = 1<<ws2812_ret_timer;				//clear the ret timer flag
+	FLEXIO0->TIMSTAT = 1 << ws2812_ret_timer;		//clear the ret timer flag
 
 	//enable FLEXIO0 module
 	FLEXIO0->CTRL = FLEXIO_CTRL_FLEXEN_MASK;
-	
-  // DMA+timer isr; FLEXIO0 ret timer is th eonly one that generates an interrupt
-  FLEXIO0->SHIFTSDEN |= 1<<ws2812_generator_shifter;		//ws2812_generator_shifter status flag triggers DMA
 
-  SIM->SCGC6 |= SIM_SCGC6_DMAMUX_MASK;								//enable access to DMAMUX registers
-  DMAMUX0->CHCFG[2] = \
-            1<<DMAMUX_CHCFG_ENBL_SHIFT	|							//enable DMA channel
-            0<<DMAMUX_CHCFG_TRIG_SHIFT	|							//triggering disabled (normal mode)
-            DMAMUX_CHCFG_SOURCE(10+ws2812_generator_shifter);	//source: ws2812_generator_shifter
+	// DMA+timer isr; FLEXIO0 ret timer is th eonly one that generates an interrupt
+	FLEXIO0->SHIFTSDEN |= 1 << ws2812_generator_shifter;//ws2812_generator_shifter status flag triggers DMA
 
-  //TODO: interrupts; FLEXIO0 (shifter & timer) flags generate interrupts
-  NVIC_SetPriority(FLEXIO0_IRQn, 1);							//set ISR priority high, but not to 0
-  while(NVIC_GetPendingIRQ(FLEXIO0_IRQn) != 0)	{	//clear any pending ISRs...
-    NVIC_ClearPendingIRQ(FLEXIO0_IRQn);					//...
-  }																										//...
-  NVIC_EnableIRQ(FLEXIO0_IRQn);									//enable the ISR
+	SIM->SCGC6 |= SIM_SCGC6_DMAMUX_MASK;	//enable access to DMAMUX registers
+	DMAMUX0->CHCFG[2] = 1 << DMAMUX_CHCFG_ENBL_SHIFT |		//enable DMA channel
+			0 << DMAMUX_CHCFG_TRIG_SHIFT |	//triggering disabled (normal mode)
+			DMAMUX_CHCFG_SOURCE(10 + ws2812_generator_shifter);	//source: ws2812_generator_shifter
+
+	//TODO: interrupts; FLEXIO0 (shifter & timer) flags generate interrupts
+	NVIC_SetPriority(FLEXIO0_IRQn, 1);	//set ISR priority high, but not to 0
+	while (NVIC_GetPendingIRQ(FLEXIO0_IRQn) != 0) {	//clear any pending ISRs...
+		NVIC_ClearPendingIRQ(FLEXIO0_IRQn);					//...
+	}																	//...
+	NVIC_EnableIRQ(FLEXIO0_IRQn);								//enable the ISR
+}
+
+/* User callback function for EDMA transfer. */
+void EDMA_Callback(edma_handle_t *handle, void *param, bool transferDone,
+		uint32_t tcds) {
+	if (transferDone) {
+		isr_transfer_done = 1;
+	}
 }
 
 //
@@ -306,68 +320,96 @@ void WS2812_Init(void) {
 // - strip data pointer (32-bit data)
 // - strip data length (in 32-bit words)
 //
-void WS2812_OutputDataDMA(uint32_t *p32_strip_data, uint32_t strip_data_word_cnt) {
+void WS2812_OutputDataDMA(uint32_t *p32_strip_data,
+		uint32_t strip_data_word_cnt) {
 	isr_data_cnt = 0;
 	isr_data_index = 0;
 	isr_cnt = 0;
 	isr_transfer_done = 0;
-	
-	FLEXIO0->TIMSTAT = 1<<ws2812_ret_timer;			//clear the ret timer flag
+
+	edma_transfer_config_t transferConfig;
+	edma_config_t userConfig;
+
+	FLEXIO0->TIMSTAT = 1 << ws2812_ret_timer;		//clear the ret timer flag
 	/*
-	DMA0->DMA[2].DSR_BCR =
-							DMA_DSR_BCR_DONE_MASK;					//clear DONE bit => stop DMA transfers
-	DMA0->DMA[2].SAR =
-							(uint32_t) p32_strip_data;			//source: strip data
-	DMA0->DMA[2].DAR =
-							(uint32_t) &FLEXIO0->SHIFTBUFBBS[ws2812_generator_shifter];	//destination: generator shifter
-	DMA0->DMA[2].DSR_BCR =
-							strip_data_word_cnt*4;					//number of bytes to transfer
-	FLEXIO0->TIMIEN |= 1<<ws2812_ret_timer;			//enable ret timer interrupt before the DMA
-	DMA0->DMA[2].DCR =
-							0<<DMA_DCR_EINT_SHIFT		|				//disable int on completion of transfer
-							1<<DMA_DCR_ERQ_SHIFT		|				//enable peripheral request
-							1<<DMA_DCR_CS_SHIFT			|				//single transfer per request
-							0<<DMA_DCR_AA_SHIFT			|				//NA
-							0<<24										|				//as per RM
-							1<<DMA_DCR_EADREQ_SHIFT	|				//enable async DMA requests
-							1<<DMA_DCR_SINC_SHIFT		|				//increment SAR
-							DMA_DCR_SSIZE(0)				|				//source size: 32 bits
-							0<<DMA_DCR_DINC_SHIFT		|				//do not increment DAR
-							DMA_DCR_DSIZE(0)				|				//destination size: 32 bits
-							0<<DMA_DCR_START_SHIFT	|				//no sw start
-							DMA_DCR_SMOD(0)					|				//source address modulo buffer disabled
-							DMA_DCR_DMOD(0)					|				//destination address modulo buffer disabled
-							1<<DMA_DCR_D_REQ_SHIFT	|				//ERQ cleared when BCR exhausted
-							DMA_DCR_LINKCC(0)				|				//no ch2ch linking
-							DMA_DCR_LCH1(0)					|				//NA
-							DMA_DCR_LCH2(0);								//NA
-	*/
-	WAITING_LOOP_IOPORT->PSOR = 1UL<<WAITING_LOOP_PIN;
-	while(isr_transfer_done == 0);
-	WAITING_LOOP_IOPORT->PCOR = 1UL<<WAITING_LOOP_PIN;
+	 DMA0->DMA[2].DSR_BCR =
+	 DMA_DSR_BCR_DONE_MASK;					//clear DONE bit => stop DMA transfers
+	 DMA0->DMA[2].SAR =
+	 (uint32_t) p32_strip_data;			//source: strip data
+	 DMA0->DMA[2].DAR =
+	 (uint32_t) &FLEXIO0->SHIFTBUFBBS[ws2812_generator_shifter];	//destination: generator shifter
+	 DMA0->DMA[2].DSR_BCR =
+	 strip_data_word_cnt*4;					//number of bytes to transfer
+	 FLEXIO0->TIMIEN |= 1<<ws2812_ret_timer;			//enable ret timer interrupt before the DMA
+	 DMA0->DMA[2].DCR =
+	 0<<DMA_DCR_EINT_SHIFT		|				//disable int on completion of transfer
+	 1<<DMA_DCR_ERQ_SHIFT		|				//enable peripheral request
+	 1<<DMA_DCR_CS_SHIFT			|				//single transfer per request
+	 0<<DMA_DCR_AA_SHIFT			|				//NA
+	 0<<24										|				//as per RM
+	 1<<DMA_DCR_EADREQ_SHIFT	|				//enable async DMA requests
+	 1<<DMA_DCR_SINC_SHIFT		|				//increment SAR
+	 DMA_DCR_SSIZE(0)				|				//source size: 32 bits
+	 0<<DMA_DCR_DINC_SHIFT		|				//do not increment DAR
+	 DMA_DCR_DSIZE(0)				|				//destination size: 32 bits
+	 0<<DMA_DCR_START_SHIFT	|				//no sw start
+	 DMA_DCR_SMOD(0)					|				//source address modulo buffer disabled
+	 DMA_DCR_DMOD(0)					|				//destination address modulo buffer disabled
+	 1<<DMA_DCR_D_REQ_SHIFT	|				//ERQ cleared when BCR exhausted
+	 DMA_DCR_LINKCC(0)				|				//no ch2ch linking
+	 DMA_DCR_LCH1(0)					|				//NA
+	 DMA_DCR_LCH2(0);								//NA
+	 */
+	/* Configure EDMA one shot transfer */
+	/*
+	 * userConfig.enableRoundRobinArbitration = false;
+	 * userConfig.enableHaltOnError = true;
+	 * userConfig.enableContinuousLinkMode = false;
+	 * userConfig.enableDebugMode = false;
+	 */
+	EDMA_GetDefaultConfig(&userConfig);
+	EDMA_Init(DMA0, &userConfig);
+	EDMA_CreateHandle(&g_EDMA_Handle, DMA0, 0);
+	EDMA_SetCallback(&g_EDMA_Handle, EDMA_Callback, NULL);
+	EDMA_PrepareTransfer(&transferConfig, (uint32_t) p32_strip_data,
+			sizeof((uint32_t) p32_strip_data),
+			(uint32_t) &FLEXIO0->SHIFTBUFBBS[ws2812_generator_shifter],
+			sizeof((uint32_t) &FLEXIO0->SHIFTBUFBBS[ws2812_generator_shifter]),
+			sizeof((uint32_t) p32_strip_data), strip_data_word_cnt * 4,
+			kEDMA_MemoryToPeripheral);
+	FLEXIO0->TIMIEN |= 1 << ws2812_ret_timer;//enable ret timer interrupt before the DMA
+	EDMA_SubmitTransfer(&g_EDMA_Handle, &transferConfig);
+	EDMA_StartTransfer(&g_EDMA_Handle);
+	/* Wait for EDMA transfer finish */
+	WAITING_LOOP_IOPORT->PSOR = 1UL << WAITING_LOOP_PIN;
+	while (isr_transfer_done == 0);
+	WAITING_LOOP_IOPORT->PCOR = 1UL << WAITING_LOOP_PIN;
 }
+
+
 
 //
 // this is the FLEXIO0 interrupt service routine
 //
 void UART2_FLEXIO_IRQHandler(void) {
-  FLEXIO_ISR_IOPORT->PSOR = 1UL<<FLEXIO_ISR_PIN;	//indicate FLEXIO0 isr begin
+	FLEXIO_ISR_IOPORT->PSOR = 1UL << FLEXIO_ISR_PIN;//indicate FLEXIO0 isr begin
 	isr_cnt++;
 	//if data still available, send them
 	if (isr_data_index != isr_data_cnt) {
 		//in case of the last round of data, disable generator shifter 
 		//interrupt and enable ret timer interrupt
-		if ((isr_data_index+1) == isr_data_cnt) {
-			FLEXIO0->SHIFTSIEN &= ~(1<<ws2812_generator_shifter);
-			FLEXIO0->TIMIEN |= 1<<ws2812_ret_timer;
+		if ((isr_data_index + 1) == isr_data_cnt) {
+			FLEXIO0->SHIFTSIEN &= ~(1 << ws2812_generator_shifter);
+			FLEXIO0->TIMIEN |= 1 << ws2812_ret_timer;
 		}
-		FLEXIO0->SHIFTBUFBBS[ws2812_generator_shifter] = *(isr_p32_strip_data+isr_data_index);
+		FLEXIO0->SHIFTBUFBBS[ws2812_generator_shifter] = *(isr_p32_strip_data
+				+ isr_data_index);
 		isr_data_index++;
 	} else {
-  	//handle ret timer flag interrupt
-		FLEXIO0->TIMIEN &= ~(1<<ws2812_ret_timer);			//disable future ret timer interrupts
-		FLEXIO0->TIMSTAT = 1<<ws2812_ret_timer;				//clear the ret timer flag
-		isr_transfer_done = 1;												//set ret code flag
+		//handle ret timer flag interrupt
+		FLEXIO0->TIMIEN &= ~(1 << ws2812_ret_timer);//disable future ret timer interrupts
+		FLEXIO0->TIMSTAT = 1 << ws2812_ret_timer;	//clear the ret timer flag
+		isr_transfer_done = 1;								//set ret code flag
 	}
-  FLEXIO_ISR_IOPORT->PCOR = 1UL<<FLEXIO_ISR_PIN;	//indicate FLEXIO0 isr end
+	FLEXIO_ISR_IOPORT->PCOR = 1UL << FLEXIO_ISR_PIN;//indicate FLEXIO0 isr end
 }
